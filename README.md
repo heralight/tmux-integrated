@@ -139,6 +139,39 @@ restore is largely redundant when this extension is your default profile.
 The extension's Output channel ("tmux-integrated") logs which terminals
 were disposed (or skipped, and why) at each activation.
 
+## Release channels
+
+tmux-integrated ships on two channels:
+
+- **Stable** — the default. Tested, recommended for everyday use.
+- **Beta (pre-release)** — early access to upcoming changes. Newer, less
+  battle-tested.
+
+Both are published to the VS Code Marketplace and to
+[Open VSX](https://open-vsx.org/) (used by Cursor, VSCodium, and others).
+
+### Switching channels in VS Code or Cursor
+
+The editor has this built in — no special download required:
+
+1. Open the **Extensions** view and select **tmux-integrated**.
+2. On the extension page, click **Switch to Pre-Release Version** to opt into
+   the beta channel (the button reads **Switch to Release Version** to go back).
+3. The editor installs the newest build for the channel you chose and keeps it
+   updated automatically.
+
+Following the
+[VS Code convention](https://code.visualstudio.com/api/working-with-extensions/publishing-extension#prerelease-extensions),
+stable releases use **even** minor versions (`0.2.x`, `0.4.x`, …) and beta
+releases use **odd** minor versions (`0.3.x`, `0.5.x`, …).
+
+### Manual install
+
+Every release also attaches a `.vsix` to its
+[GitHub release](https://github.com/pcassidy75/tmux-integrated/releases)
+(beta builds are marked as pre-releases). Download it and run
+**Extensions: Install from VSIX…** from the command palette.
+
 ## Extension settings
 
 | Setting | Default | Description |

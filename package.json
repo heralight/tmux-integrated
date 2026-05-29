@@ -99,16 +99,20 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts",
+    "lint": "eslint src",
     "changelog": "node scripts/update-changelog.js",
     "version": "npm run changelog && git add CHANGELOG.md",
-    "release": "npm version patch && git push --follow-tags"
+    "release:beta": "node scripts/release.js beta",
+    "release:stable": "node scripts/release.js stable",
+    "release": "node scripts/release.js stable"
   },
   "devDependencies": {
-    "@types/node": "^20.x",
+    "@types/node": "^20.19.41",
     "@types/vscode": "^1.80.0",
     "@vscode/vsce": "^3.9.1",
+    "eslint": "^9.39.4",
     "ovsx": "^0.10.10",
-    "typescript": "^5.1.0"
+    "typescript": "^5.1.0",
+    "typescript-eslint": "^8.60.0"
   }
 }

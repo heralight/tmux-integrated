@@ -13,34 +13,51 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Determine release channel
+        id: channel
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          MINOR=$(printf '%s' "$VERSION" | cut -d. -f2)
+          if [ "$((MINOR % 2))" -eq 1 ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Channel: beta (pre-release) for $VERSION (odd minor)"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Channel: stable for $VERSION (even minor)"
+          fi
+
       - name: Package extension
-        run: npx vsce package
+        run: |
+          PRE=""
+          if [ "${{ steps.channel.outputs.prerelease }}" = "true" ]; then PRE="--pre-release"; fi
+          npx vsce package $PRE -o tmux-integrated.vsix
 
       - name: Publish extension to VS Code Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npx vsce publish
+        run: npx vsce publish --packagePath tmux-integrated.vsix
         continue-on-error: true
 
       - name: Publish extension to Open VSX
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: npx ovsx publish *.vsix -p "$OVSX_PAT"
+        run: npx ovsx publish tmux-integrated.vsix -p "$OVSX_PAT"
         continue-on-error: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: '*.vsix'
+          prerelease: ${{ steps.channel.outputs.prerelease }}
           generate_release_notes: true

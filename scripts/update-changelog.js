@@ -11,14 +11,30 @@ const { version } = require(path.join(root, 'package.json'));
 
 const date = new Date().toISOString().slice(0, 10);
 
-// Find the previous tag to scope git log
+// Channel is encoded in the minor's parity (odd = beta/pre-release, even = stable).
+// Beta builds are transient, so we keep CHANGELOG.md stable-only and skip them.
+const minor = Number(version.split('.')[1]);
+if (minor % 2 === 1) {
+  console.log(`Skipping changelog for pre-release version ${version} (odd minor).`);
+  process.exit(0);
+}
+
+// Find the previous tag to scope git log.
 const tags = execSync('git tag -l "v*" --sort=-v:refname', { cwd: root, encoding: 'utf8' })
   .split('\n')
   .filter(Boolean);
 
-// The current version tag (v0.1.12) won't exist yet when this runs inside
-// `npm version`, so the first tag in the list is the previous release.
-const prevTag = tags[0];
+// For a stable release, scope to the previous *stable* (even-minor) tag so the
+// entry aggregates everything shipped since the last stable release, including
+// changes that already went out on the beta channel. The current version tag
+// (e.g. v0.4.0) doesn't exist yet inside `npm version`, so the first matching
+// tag is the previous stable. Fall back to the most recent tag of any kind
+// (covers the initial migration when no even-minor tag exists yet).
+const isStableTag = (tag) => {
+  const m = /^v\d+\.(\d+)\.\d+$/.exec(tag);
+  return m && Number(m[1]) % 2 === 0;
+};
+const prevTag = tags.find(isStableTag) || tags[0];
 
 // Get commit messages since the previous tag, excluding merges and version bumps
 const range = prevTag ? `${prevTag}..HEAD` : 'HEAD';

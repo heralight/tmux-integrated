@@ -122,7 +122,7 @@ export class TmuxControlClient extends EventEmitter {
 
         for (const candidate of candidates) {
             try {
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
                 return require(candidate);
             } catch {
                 // Try the next candidate.
