@@ -28,7 +28,7 @@ everyone forward.
 ## Prerequisites
 
 - All changes merged to `main`; working tree clean and on `main`.
-- `npm ci` has been run at least once (provides `vsce` / `ovsx`).
+- `npm ci  --ignore-scripts` has been run at least once (provides `vsce` / `ovsx`).
 - GitHub secrets `VSCE_PAT` and `OVSX_PAT` are configured (the publish steps use
   `continue-on-error`, so a missing token doesn't fail the whole run).
 
