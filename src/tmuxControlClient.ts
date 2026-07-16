@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import * as path from 'path';
 
 import { TmuxGateway, CommandFlags } from './tmuxGateway';
@@ -49,6 +50,21 @@ interface IPty {
     kill(signal?: string): void;
     pid: number;
 }
+
+type NodePtyModule = {
+    spawn(
+        file: string,
+        args: string[],
+        options: {
+            name?: string;
+            cols?: number;
+            rows?: number;
+            cwd?: string;
+            env?: Record<string, string>;
+            encoding?: string | null;
+        },
+    ): IPty;
+};
 
 export interface TmuxWindow {
     id: string;
@@ -104,34 +120,58 @@ export class TmuxControlClient extends EventEmitter {
     }
 
     /**
-     * Locate VS Code's bundled node-pty.  The exact path varies between local
-     * and remote (SSH / WSL / tunnel) installs and across VS Code versions:
-     *   • node_modules/node-pty              — older, local installs
-     *   • node_modules.asar.unpacked/node-pty — native modules extracted from asar
-     *   • node_modules/@vscode/node-pty       — scoped package in recent builds
-     *   • node_modules.asar.unpacked/@vscode/node-pty
+     * Load node-pty with the native binary bundled for the current VS Code
+     * runtime. Older VS Code releases expose the complete package directly.
+     * Newer releases keep JavaScript in node_modules.asar and unpack only the
+     * native files, so pair those files with this extension's node-pty copy.
      */
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private requireNodePty(): any {
-        const candidates = [
+    private requireNodePty(): NodePtyModule {
+        const directCandidates = [
             path.join(this.appRoot, 'node_modules', 'node-pty'),
             path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
             path.join(this.appRoot, 'node_modules', '@vscode', 'node-pty'),
             path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
         ];
 
-        for (const candidate of candidates) {
+        for (const candidate of directCandidates) {
             try {
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
-                return require(candidate);
+                return require(candidate) as NodePtyModule;
             } catch {
-                // Try the next candidate.
+                // Newer VS Code releases unpack only this package's native files.
+            }
+        }
+
+        const unpackedPackageRoots = [
+            path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
+            path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
+        ];
+        const nativeDirectoryPaths = [
+            path.join('build', 'Release'),
+            path.join('build', 'Debug'),
+            path.join('prebuilds', `${process.platform}-${process.arch}`),
+        ];
+
+        const localPackageRoot = path.dirname(require.resolve('node-pty/package.json'));
+        for (const unpackedPackageRoot of unpackedPackageRoots) {
+            for (const nativeDirectoryPath of nativeDirectoryPaths) {
+                const sourcePath = path.join(unpackedPackageRoot, nativeDirectoryPath);
+                if (!fs.existsSync(sourcePath)) {
+                    continue;
+                }
+
+                const destinationPath = path.join(localPackageRoot, nativeDirectoryPath);
+                fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+                fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
+
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                return require(localPackageRoot) as NodePtyModule;
             }
         }
 
         throw new Error(
-            `node-pty not found in VS Code installation (appRoot: ${this.appRoot}). ` +
-            `Searched: ${candidates.join(', ')}`,
+            `node-pty native files not found in VS Code installation (appRoot: ${this.appRoot}). ` +
+            `Searched package roots: ${unpackedPackageRoots.join(', ')}`,
         );
     }
 
@@ -154,20 +194,7 @@ export class TmuxControlClient extends EventEmitter {
                 tmuxArgs.push('-c', options.startDirectory);
             }
 
-            const nodePty = this.requireNodePty() as {
-                spawn(
-                    file: string,
-                    args: string[],
-                    options: {
-                        name?: string;
-                        cols?: number;
-                        rows?: number;
-                        cwd?: string;
-                        env?: Record<string, string>;
-                        encoding?: string | null;
-                    },
-                ): IPty;
-            };
+            const nodePty = this.requireNodePty();
 
             this.pty = nodePty.spawn(this.tmuxBinaryPath, tmuxArgs, {
                 name: 'xterm-256color',

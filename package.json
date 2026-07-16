@@ -114,5 +114,8 @@
     "ovsx": "^0.10.10",
     "typescript": "^5.1.0",
     "typescript-eslint": "^8.60.0"
+  },
+  "dependencies": {
+    "node-pty": "1.2.0-beta.13"
   }
 }
