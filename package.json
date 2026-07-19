@@ -100,6 +100,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src",
+    "test": "npm run compile && node --test test/*.test.js",
     "changelog": "node scripts/update-changelog.js",
     "version": "npm run changelog && git add CHANGELOG.md",
     "release:beta": "node scripts/release.js beta",

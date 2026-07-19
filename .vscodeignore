@@ -9,4 +9,5 @@ node_modules/**
 !node_modules/node-pty/lib/**
 eslint.config.mjs
 scripts/**
+test/**
 .github/**
