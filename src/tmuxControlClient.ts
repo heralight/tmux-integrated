@@ -106,32 +106,51 @@ export class TmuxControlClient extends EventEmitter {
     /**
      * Locate VS Code's bundled node-pty.  The exact path varies between local
      * and remote (SSH / WSL / tunnel) installs and across VS Code versions:
-     *   • node_modules/node-pty              — older, local installs
-     *   • node_modules.asar.unpacked/node-pty — native modules extracted from asar
-     *   • node_modules/@vscode/node-pty       — scoped package in recent builds
-     *   • node_modules.asar.unpacked/@vscode/node-pty
+     *   • node_modules/node-pty               — remote server, older local installs
+     *   • node_modules.asar/node-pty          — desktop ≥ 1.129 (JS inside the
+     *     asar archive; the native pty.node lives in node_modules.asar.unpacked
+     *     and Electron redirects the load there transparently)
+     *   • node_modules.asar.unpacked/node-pty — older asar-packaged desktop
+     *     builds that unpacked the whole module
+     *   • node_modules/@vscode/node-pty and the asar variants — scoped package
+     *     name used by some builds
+     *
+     * Requiring from inside node_modules.asar only works in VS Code's own
+     * Electron processes (the extension host is one), where VS Code's
+     * bootstrap patches Node's resolution for exactly this purpose.  On a
+     * plain-Node remote server the asar candidates simply fail resolution and
+     * the plain node_modules candidate is used instead.
      */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private requireNodePty(): any {
-        const candidates = [
-            path.join(this.appRoot, 'node_modules', 'node-pty'),
-            path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
-            path.join(this.appRoot, 'node_modules', '@vscode', 'node-pty'),
-            path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
-        ];
+        const roots = ['node_modules', 'node_modules.asar', 'node_modules.asar.unpacked'];
+        const packages = [['node-pty'], ['@vscode', 'node-pty']];
+        const candidates = packages.flatMap((pkg) =>
+            roots.map((root) => path.join(this.appRoot, root, ...pkg)),
+        );
 
+        const failures: string[] = [];
         for (const candidate of candidates) {
             try {
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 return require(candidate);
-            } catch {
-                // Try the next candidate.
+            } catch (err) {
+                // Distinguish "candidate does not exist" from "candidate
+                // exists but failed to load" (e.g. native ABI mismatch) so
+                // the error below points at the real problem.
+                const code = (err as NodeJS.ErrnoException)?.code;
+                const message = err instanceof Error ? err.message : String(err);
+                failures.push(
+                    code === 'MODULE_NOT_FOUND' && message.includes(candidate)
+                        ? `${candidate}: not found`
+                        : `${candidate}: ${message}`,
+                );
             }
         }
 
         throw new Error(
-            `node-pty not found in VS Code installation (appRoot: ${this.appRoot}). ` +
-            `Searched: ${candidates.join(', ')}`,
+            `node-pty could not be loaded from the VS Code installation (appRoot: ${this.appRoot}).\n` +
+            failures.map((f) => `  - ${f}`).join('\n'),
         );
     }
 
