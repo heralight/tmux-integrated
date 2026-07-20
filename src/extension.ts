@@ -35,6 +35,7 @@ let tmuxVersion: string | null = null;
 let currentSessionName = 'vscode';
 let tmuxBinaryPath: string | null = null;
 let extensionRootPath = process.cwd();
+let globalStoragePath: string | undefined;
 let defaultStartDirectory = process.cwd();
 interface AdoptableWindow {
     windowId: string;
@@ -73,6 +74,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(outputChannel);
 
     extensionRootPath = context.extensionPath;
+    globalStoragePath = context.globalStorageUri.fsPath;
     defaultStartDirectory = resolveStartDirectory(context.extensionPath);
     currentSessionName = resolveSessionName();
 
@@ -425,6 +427,7 @@ async function ensureClientConnectedImpl(startDirectory: string): Promise<boolea
         currentSessionName,
         tmuxBinaryPath!,
         vscode.env.appRoot,
+        globalStoragePath,
     );
 
     // Feed the version string so the client can gate features accordingly

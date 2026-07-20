@@ -91,6 +91,13 @@ export class TmuxControlClient extends EventEmitter {
         private readonly sessionName: string,
         private readonly tmuxBinaryPath: string,
         private readonly appRoot: string,
+        /**
+         * Writable directory (the extension's global storage) where the
+         * node-pty shim fallback may materialize a loadable package.  When
+         * omitted, the shim is materialized next to the extension's bundled
+         * node-pty JavaScript instead.
+         */
+        private readonly shimStorageDir?: string,
     ) {
         super();
     }
@@ -188,7 +195,10 @@ export class TmuxControlClient extends EventEmitter {
      * the resulting loadable package.
      *
      * The native files always come from the running VS Code installation so
-     * they match the extension host's ABI.
+     * they match the extension host's ABI.  The package is materialized in
+     * the extension's global storage (when provided) rather than inside the
+     * extension install directory, which may be read-only and is replaced on
+     * every extension update.
      */
     private materializeNodePtyShim(): string {
         const unpackedPackageRoots = [
@@ -211,10 +221,30 @@ export class TmuxControlClient extends EventEmitter {
                     continue;
                 }
 
-                const destinationPath = path.join(bundledPackageRoot, nativeDirectoryPath);
+                const shimPackageRoot = this.shimStorageDir
+                    ? path.join(this.shimStorageDir, 'node-pty')
+                    : bundledPackageRoot;
+
+                if (shimPackageRoot !== bundledPackageRoot) {
+                    // Copy the bundled JavaScript (package.json + lib) into
+                    // the shim so the whole package lives in writable storage.
+                    fs.mkdirSync(shimPackageRoot, { recursive: true });
+                    fs.cpSync(
+                        path.join(bundledPackageRoot, 'package.json'),
+                        path.join(shimPackageRoot, 'package.json'),
+                        { force: true },
+                    );
+                    fs.cpSync(
+                        path.join(bundledPackageRoot, 'lib'),
+                        path.join(shimPackageRoot, 'lib'),
+                        { recursive: true, force: true },
+                    );
+                }
+
+                const destinationPath = path.join(shimPackageRoot, nativeDirectoryPath);
                 fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
                 fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
-                return bundledPackageRoot;
+                return shimPackageRoot;
             }
         }
 

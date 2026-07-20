@@ -124,7 +124,11 @@ test('uses the selected workspace folder as a new tmux terminal cwd', async () =
 
   try {
     const extension = require('../out/extension.js');
-    await extension.activate({ extensionPath: '/extension', subscriptions: [] });
+    await extension.activate({
+      extensionPath: '/extension',
+      globalStorageUri: { fsPath: '/extension-storage' },
+      subscriptions: [],
+    });
     assert.ok(profileProvider, 'profile provider was registered');
 
     const profile = await profileProvider.provideTerminalProfile({ isCancellationRequested: false });
