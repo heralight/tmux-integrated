@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import * as path from 'path';
 
 import { TmuxGateway, CommandFlags } from './tmuxGateway';
@@ -49,6 +50,21 @@ interface IPty {
     kill(signal?: string): void;
     pid: number;
 }
+
+type NodePtyModule = {
+    spawn(
+        file: string,
+        args: string[],
+        options: {
+            name?: string;
+            cols?: number;
+            rows?: number;
+            cwd?: string;
+            env?: Record<string, string>;
+            encoding?: string | null;
+        },
+    ): IPty;
+};
 
 export interface TmuxWindow {
     id: string;
@@ -120,9 +136,14 @@ export class TmuxControlClient extends EventEmitter {
      * bootstrap patches Node's resolution for exactly this purpose.  On a
      * plain-Node remote server the asar candidates simply fail resolution and
      * the plain node_modules candidate is used instead.
+     *
+     * When no candidate provides a loadable package (e.g. a future layout
+     * that ships only the unpacked native files), fall back to pairing the
+     * extension's bundled node-pty JavaScript with the native files from the
+     * VS Code installation — the same technique VS Code's Copilot extension
+     * uses.
      */
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private requireNodePty(): any {
+    private requireNodePty(): NodePtyModule {
         const roots = ['node_modules', 'node_modules.asar', 'node_modules.asar.unpacked'];
         const packages = [['node-pty'], ['@vscode', 'node-pty']];
         const candidates = packages.flatMap((pkg) =>
@@ -133,7 +154,7 @@ export class TmuxControlClient extends EventEmitter {
         for (const candidate of candidates) {
             try {
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
-                return require(candidate);
+                return require(candidate) as NodePtyModule;
             } catch (err) {
                 // Distinguish "candidate does not exist" from "candidate
                 // exists but failed to load" (e.g. native ABI mismatch) so
@@ -148,9 +169,57 @@ export class TmuxControlClient extends EventEmitter {
             }
         }
 
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            return require(this.materializeNodePtyShim()) as NodePtyModule;
+        } catch (err) {
+            failures.push(`shim fallback: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
         throw new Error(
             `node-pty could not be loaded from the VS Code installation (appRoot: ${this.appRoot}).\n` +
             failures.map((f) => `  - ${f}`).join('\n'),
+        );
+    }
+
+    /**
+     * Pair the extension's bundled node-pty JavaScript with the native files
+     * that VS Code unpacks from its asar archive, and return the directory of
+     * the resulting loadable package.
+     *
+     * The native files always come from the running VS Code installation so
+     * they match the extension host's ABI.
+     */
+    private materializeNodePtyShim(): string {
+        const unpackedPackageRoots = [
+            path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
+            path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
+            path.join(this.appRoot, 'node_modules', 'node-pty'),
+            path.join(this.appRoot, 'node_modules', '@vscode', 'node-pty'),
+        ];
+        const nativeDirectoryPaths = [
+            path.join('build', 'Release'),
+            path.join('build', 'Debug'),
+            path.join('prebuilds', `${process.platform}-${process.arch}`),
+        ];
+
+        const bundledPackageRoot = path.dirname(require.resolve('node-pty/package.json'));
+        for (const unpackedPackageRoot of unpackedPackageRoots) {
+            for (const nativeDirectoryPath of nativeDirectoryPaths) {
+                const sourcePath = path.join(unpackedPackageRoot, nativeDirectoryPath);
+                if (!fs.existsSync(sourcePath)) {
+                    continue;
+                }
+
+                const destinationPath = path.join(bundledPackageRoot, nativeDirectoryPath);
+                fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+                fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
+                return bundledPackageRoot;
+            }
+        }
+
+        throw new Error(
+            `no native node-pty files found (searched ${unpackedPackageRoots.join(', ')})`,
         );
     }
 
@@ -173,20 +242,7 @@ export class TmuxControlClient extends EventEmitter {
                 tmuxArgs.push('-c', options.startDirectory);
             }
 
-            const nodePty = this.requireNodePty() as {
-                spawn(
-                    file: string,
-                    args: string[],
-                    options: {
-                        name?: string;
-                        cols?: number;
-                        rows?: number;
-                        cwd?: string;
-                        env?: Record<string, string>;
-                        encoding?: string | null;
-                    },
-                ): IPty;
-            };
+            const nodePty = this.requireNodePty();
 
             this.pty = nodePty.spawn(this.tmuxBinaryPath, tmuxArgs, {
                 name: 'xterm-256color',
