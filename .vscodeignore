@@ -5,6 +5,9 @@ src/**
 **/tsconfig.json
 **/*.map
 node_modules/**
+!node_modules/node-pty/package.json
+!node_modules/node-pty/lib/**
 eslint.config.mjs
 scripts/**
+test/**
 .github/**

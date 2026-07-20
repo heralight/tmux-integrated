@@ -35,6 +35,7 @@ let tmuxVersion: string | null = null;
 let currentSessionName = 'vscode';
 let tmuxBinaryPath: string | null = null;
 let extensionRootPath = process.cwd();
+let globalStoragePath: string | undefined;
 let defaultStartDirectory = process.cwd();
 interface AdoptableWindow {
     windowId: string;
@@ -73,6 +74,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(outputChannel);
 
     extensionRootPath = context.extensionPath;
+    globalStoragePath = context.globalStorageUri.fsPath;
     defaultStartDirectory = resolveStartDirectory(context.extensionPath);
     currentSessionName = resolveSessionName();
 
@@ -272,32 +274,50 @@ function registerTerminalProfile(context: vscode.ExtensionContext): void {
                 try {
                     log('provideTerminalProfile called');
                     pendingUserTerminalFocus = true;
-                    const connected = await ensureClientConnected();
+
+                    let startDirectory: string | undefined;
+                    if (shouldPickStartDirectoryBeforeConnecting()) {
+                        startDirectory = await pickStartDirectory(extensionRootPath);
+                        if (!startDirectory) {
+                            throw new vscode.CancellationError();
+                        }
+                    }
+
+                    const connected = await ensureClientConnected(startDirectory);
                     if (!connected) {
                         throw new Error('tmux-integrated: Could not connect to tmux. See Output > tmux-integrated for details.');
                     }
 
-                // Reuse the bootstrap window from a freshly-created session.
-                const bootstrap = takeBootstrapWindow();
-                if (bootstrap) {
-                    log(`provideTerminalProfile: using bootstrap window ${bootstrap.windowId}`);
-                    return buildTerminalProfile(bootstrap);
-                }
+                    // Reuse the bootstrap window from a freshly-created session.
+                    const bootstrap = takeBootstrapWindow();
+                    if (bootstrap) {
+                        log(`provideTerminalProfile: using bootstrap window ${bootstrap.windowId}`);
+                        return buildTerminalProfile(bootstrap, startDirectory);
+                    }
 
-                // On reconnection, adopt one pre-existing window for this tab
-                // and schedule the rest to appear as additional tabs.
-                const adopted = adoptNextWindow();
-                if (adopted) {
-                    log(`provideTerminalProfile: adopting window ${adopted.windowId}`);
-                    return buildTerminalProfile(adopted);
-                }
+                    // On reconnection, adopt one pre-existing window for this tab
+                    // and schedule the rest to appear as additional tabs.
+                    const adopted = adoptNextWindow();
+                    if (adopted) {
+                        log(`provideTerminalProfile: adopting window ${adopted.windowId}`);
+                        return buildTerminalProfile(adopted);
+                    }
 
-                // Already connected and everything adopted — create a new window.
-                log('provideTerminalProfile: creating new terminal (no bootstrap/adopt)');
-                return buildTerminalProfile();
+                    // VS Code does not expose its multi-root terminal-location
+                    // selection to custom PTY profile providers, so ask here
+                    // before creating a genuinely new tmux window.
+                    startDirectory ??= await pickStartDirectory(extensionRootPath);
+                    if (!startDirectory) {
+                        throw new vscode.CancellationError();
+                    }
+
+                    log(`provideTerminalProfile: creating new terminal in ${startDirectory} (no bootstrap/adopt)`);
+                    return buildTerminalProfile(undefined, startDirectory);
                 } catch (err) {
                     pendingUserTerminalFocus = false;
-                    log(`provideTerminalProfile error: ${err}`);
+                    if (!(err instanceof vscode.CancellationError)) {
+                        log(`provideTerminalProfile error: ${err}`);
+                    }
                     throw err;
                 }
             },
@@ -308,10 +328,12 @@ function registerTerminalProfile(context: vscode.ExtensionContext): void {
 function registerCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('tmux-integrated.newTerminal', async () => {
-            const connected = await ensureClientConnected();
+            const startDirectory = await pickStartDirectory(extensionRootPath);
+            if (!startDirectory) { return; }
+            const connected = await ensureClientConnected(startDirectory);
             if (!connected) { return; }
             const terminal = vscode.window.createTerminal(
-                buildTerminalOptions(),
+                buildTerminalOptions(undefined, startDirectory),
             );
             terminal.show();
         }),
@@ -341,11 +363,11 @@ function registerCommands(context: vscode.ExtensionContext): void {
     );
 }
 
-async function ensureClientConnected(): Promise<boolean> {
+async function ensureClientConnected(startDirectory = defaultStartDirectory): Promise<boolean> {
     if (inFlightConnect) {
         return inFlightConnect;
     }
-    inFlightConnect = ensureClientConnectedImpl();
+    inFlightConnect = ensureClientConnectedImpl(startDirectory);
     try {
         return await inFlightConnect;
     } finally {
@@ -353,7 +375,7 @@ async function ensureClientConnected(): Promise<boolean> {
     }
 }
 
-async function ensureClientConnectedImpl(): Promise<boolean> {
+async function ensureClientConnectedImpl(startDirectory: string): Promise<boolean> {
     if (client?.isConnected()) {
         // Verify the control-mode connection is actually alive.
         try {
@@ -405,6 +427,7 @@ async function ensureClientConnectedImpl(): Promise<boolean> {
         currentSessionName,
         tmuxBinaryPath!,
         vscode.env.appRoot,
+        globalStoragePath,
     );
 
     // Feed the version string so the client can gate features accordingly
@@ -426,7 +449,7 @@ async function ensureClientConnectedImpl(): Promise<boolean> {
     });
 
     try {
-        await client.connect({ startDirectory: defaultStartDirectory });
+        await client.connect({ startDirectory });
         log('Connected to tmux successfully');
     } catch (err) {
         log(`Connection failed: ${err}`);
@@ -499,13 +522,14 @@ async function ensureClientConnectedImpl(): Promise<boolean> {
 
 function buildTerminalOptions(
     existingWindow?: AdoptableWindow,
+    startDirectory = defaultStartDirectory,
 ): vscode.ExtensionTerminalOptions {
     const cfg = vscode.workspace.getConfiguration('tmux-integrated');
     const shell = (cfg.get<string>('shell') || process.env.SHELL || '/bin/bash') || undefined;
 
     const pty = new TmuxTerminal(
         client!,
-        defaultStartDirectory,
+        startDirectory,
         collectVscodeEnvVars(),
         shell || undefined,
         existingWindow,
@@ -530,8 +554,9 @@ function buildTerminalOptions(
 
 function buildTerminalProfile(
     existingWindow?: AdoptableWindow,
+    startDirectory = defaultStartDirectory,
 ): vscode.TerminalProfile {
-    return new vscode.TerminalProfile(buildTerminalOptions(existingWindow));
+    return new vscode.TerminalProfile(buildTerminalOptions(existingWindow, startDirectory));
 }
 
 function takeBootstrapWindow(): AdoptableWindow | undefined {
@@ -638,24 +663,57 @@ function resolveSessionName(): string {
     return sanitizeName(path.basename(defaultStartDirectory)) || 'vscode';
 }
 
-function resolveStartDirectory(extensionPath: string): string {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+function resolveStartDirectory(
+    extensionPath: string,
+    folder = vscode.workspace.workspaceFolders?.[0],
+): string {
+    const workspaceFolder = folder?.uri.fsPath;
 
     // 1. tmux-integrated.cwd
-    const cfg = vscode.workspace.getConfiguration('tmux-integrated');
+    const cfg = vscode.workspace.getConfiguration('tmux-integrated', folder?.uri);
     const cwdSetting = cfg.get<string>('cwd');
     if (cwdSetting) {
         return resolveVariables(cwdSetting, workspaceFolder, extensionPath);
     }
 
     // 2. terminal.integrated.cwd
-    const termCwd = vscode.workspace.getConfiguration('terminal.integrated').get<string>('cwd');
+    const termCwd = vscode.workspace
+        .getConfiguration('terminal.integrated', folder?.uri)
+        .get<string>('cwd');
     if (termCwd) {
         return resolveVariables(termCwd, workspaceFolder, extensionPath);
     }
 
     // 3. Workspace folder
     return workspaceFolder || extensionPath;
+}
+
+async function pickStartDirectory(extensionPath: string): Promise<string | undefined> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length <= 1) {
+        return resolveStartDirectory(extensionPath, folders?.[0]);
+    }
+
+    const picked = await vscode.window.showQuickPick(
+        folders.map((workspaceFolder) => ({
+            label: workspaceFolder.name,
+            description: workspaceFolder.uri.fsPath,
+            workspaceFolder,
+        })),
+        { placeHolder: 'Select current working directory for new tmux terminal' },
+    );
+    return picked
+        ? resolveStartDirectory(extensionPath, picked.workspaceFolder)
+        : undefined;
+}
+
+function shouldPickStartDirectoryBeforeConnecting(): boolean {
+    if (client?.isConnected() || inFlightConnect) {
+        return false;
+    }
+
+    const binaryPath = tmuxBinaryPath ?? resolveTmuxBinaryPathSafe();
+    return binaryPath !== null && !tmuxSessionExists(binaryPath, resolveSessionName());
 }
 
 /**
