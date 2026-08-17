@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import * as path from 'path';
 
 import { TmuxGateway, CommandFlags } from './tmuxGateway';
@@ -49,6 +50,21 @@ interface IPty {
     kill(signal?: string): void;
     pid: number;
 }
+
+type NodePtyModule = {
+    spawn(
+        file: string,
+        args: string[],
+        options: {
+            name?: string;
+            cols?: number;
+            rows?: number;
+            cwd?: string;
+            env?: Record<string, string>;
+            encoding?: string | null;
+        },
+    ): IPty;
+};
 
 export interface TmuxWindow {
     id: string;
@@ -75,6 +91,13 @@ export class TmuxControlClient extends EventEmitter {
         private readonly sessionName: string,
         private readonly tmuxBinaryPath: string,
         private readonly appRoot: string,
+        /**
+         * Writable directory (the extension's global storage) where the
+         * node-pty shim fallback may materialize a loadable package.  When
+         * omitted, the shim is materialized next to the extension's bundled
+         * node-pty JavaScript instead.
+         */
+        private readonly shimStorageDir?: string,
     ) {
         super();
     }
@@ -106,32 +129,142 @@ export class TmuxControlClient extends EventEmitter {
     /**
      * Locate VS Code's bundled node-pty.  The exact path varies between local
      * and remote (SSH / WSL / tunnel) installs and across VS Code versions:
-     *   • node_modules/node-pty              — older, local installs
-     *   • node_modules.asar.unpacked/node-pty — native modules extracted from asar
-     *   • node_modules/@vscode/node-pty       — scoped package in recent builds
-     *   • node_modules.asar.unpacked/@vscode/node-pty
+     *   • node_modules/node-pty               — remote server, older local installs
+     *   • node_modules.asar/node-pty          — desktop ≥ 1.129 (JS inside the
+     *     asar archive; the native pty.node lives in node_modules.asar.unpacked
+     *     and Electron redirects the load there transparently)
+     *   • node_modules.asar.unpacked/node-pty — older asar-packaged desktop
+     *     builds that unpacked the whole module
+     *   • node_modules/@vscode/node-pty and the asar variants — scoped package
+     *     name used by some builds
+     *
+     * Requiring from inside node_modules.asar only works in VS Code's own
+     * Electron processes (the extension host is one), where VS Code's
+     * bootstrap patches Node's resolution for exactly this purpose.  On a
+     * plain-Node remote server the asar candidates simply fail resolution and
+     * the plain node_modules candidate is used instead.
+     *
+     * When no candidate provides a loadable package (e.g. a future layout
+     * that ships only the unpacked native files), fall back to pairing the
+     * extension's bundled node-pty JavaScript with the native files from the
+     * VS Code installation — the same technique VS Code's Copilot extension
+     * uses.
      */
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private requireNodePty(): any {
-        const candidates = [
-            path.join(this.appRoot, 'node_modules', 'node-pty'),
-            path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
-            path.join(this.appRoot, 'node_modules', '@vscode', 'node-pty'),
-            path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
-        ];
+    private requireNodePty(): NodePtyModule {
+        const roots = ['node_modules', 'node_modules.asar', 'node_modules.asar.unpacked'];
+        const packages = [['node-pty'], ['@vscode', 'node-pty']];
+        const candidates = packages.flatMap((pkg) =>
+            roots.map((root) => path.join(this.appRoot, root, ...pkg)),
+        );
 
+        const failures: string[] = [];
         for (const candidate of candidates) {
             try {
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
-                return require(candidate);
-            } catch {
-                // Try the next candidate.
+                return require(candidate) as NodePtyModule;
+            } catch (err) {
+                // Distinguish "candidate does not exist" from "candidate
+                // exists but failed to load" (e.g. native ABI mismatch) so
+                // the error below points at the real problem.
+                const code = (err as NodeJS.ErrnoException)?.code;
+                const message = err instanceof Error ? err.message : String(err);
+                failures.push(
+                    code === 'MODULE_NOT_FOUND' && message.includes(candidate)
+                        ? `${candidate}: not found`
+                        : `${candidate}: ${message}`,
+                );
+            }
+        }
+
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            return require(this.materializeNodePtyShim()) as NodePtyModule;
+        } catch (err) {
+            failures.push(`shim fallback: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        throw new Error(
+            `node-pty could not be loaded from the VS Code installation (appRoot: ${this.appRoot}).\n` +
+            failures.map((f) => `  - ${f}`).join('\n'),
+        );
+    }
+
+    /**
+     * Pair the extension's bundled node-pty JavaScript with the native files
+     * that VS Code unpacks from its asar archive, and return the directory of
+     * the resulting loadable package.
+     *
+     * The native files always come from the running VS Code installation so
+     * they match the extension host's ABI.  The package is materialized in
+     * the extension's global storage (when provided) rather than inside the
+     * extension install directory, which may be read-only and is replaced on
+     * every extension update.
+     */
+    private materializeNodePtyShim(): string {
+        const unpackedPackageRoots = [
+            path.join(this.appRoot, 'node_modules.asar.unpacked', 'node-pty'),
+            path.join(this.appRoot, 'node_modules.asar.unpacked', '@vscode', 'node-pty'),
+            path.join(this.appRoot, 'node_modules', 'node-pty'),
+            path.join(this.appRoot, 'node_modules', '@vscode', 'node-pty'),
+        ];
+        const nativeDirectoryPaths = [
+            path.join('build', 'Release'),
+            path.join('build', 'Debug'),
+            path.join('prebuilds', `${process.platform}-${process.arch}`),
+        ];
+
+        const bundledPackageRoot = path.dirname(require.resolve('node-pty/package.json'));
+        for (const unpackedPackageRoot of unpackedPackageRoots) {
+            for (const nativeDirectoryPath of nativeDirectoryPaths) {
+                const sourcePath = path.join(unpackedPackageRoot, nativeDirectoryPath);
+                if (!fs.existsSync(sourcePath)) {
+                    continue;
+                }
+
+                const shimPackageRoot = this.shimStorageDir
+                    ? path.join(this.shimStorageDir, 'node-pty')
+                    : bundledPackageRoot;
+                const destinationPath = path.join(shimPackageRoot, nativeDirectoryPath);
+
+                // A copy can fail even though a usable shim already exists —
+                // e.g. on Windows another extension host (a second VS Code
+                // window sharing this global storage) has the previously
+                // copied pty.node loaded and the overwrite raises EPERM /
+                // EBUSY.  The shim contents are the same for a given VS Code
+                // and extension version, so reuse what is already there.
+                try {
+                    if (shimPackageRoot !== bundledPackageRoot) {
+                        // Copy the bundled JavaScript (package.json + lib) into
+                        // the shim so the whole package lives in writable storage.
+                        fs.mkdirSync(shimPackageRoot, { recursive: true });
+                        fs.cpSync(
+                            path.join(bundledPackageRoot, 'package.json'),
+                            path.join(shimPackageRoot, 'package.json'),
+                            { force: true },
+                        );
+                        fs.cpSync(
+                            path.join(bundledPackageRoot, 'lib'),
+                            path.join(shimPackageRoot, 'lib'),
+                            { recursive: true, force: true },
+                        );
+                    }
+
+                    fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+                    fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
+                } catch (err) {
+                    const materialized =
+                        fs.existsSync(path.join(shimPackageRoot, 'package.json')) &&
+                        fs.existsSync(destinationPath);
+                    if (!materialized) {
+                        throw err;
+                    }
+                }
+                return shimPackageRoot;
             }
         }
 
         throw new Error(
-            `node-pty not found in VS Code installation (appRoot: ${this.appRoot}). ` +
-            `Searched: ${candidates.join(', ')}`,
+            `no native node-pty files found (searched ${unpackedPackageRoots.join(', ')})`,
         );
     }
 
@@ -154,20 +287,7 @@ export class TmuxControlClient extends EventEmitter {
                 tmuxArgs.push('-c', options.startDirectory);
             }
 
-            const nodePty = this.requireNodePty() as {
-                spawn(
-                    file: string,
-                    args: string[],
-                    options: {
-                        name?: string;
-                        cols?: number;
-                        rows?: number;
-                        cwd?: string;
-                        env?: Record<string, string>;
-                        encoding?: string | null;
-                    },
-                ): IPty;
-            };
+            const nodePty = this.requireNodePty();
 
             this.pty = nodePty.spawn(this.tmuxBinaryPath, tmuxArgs, {
                 name: 'xterm-256color',

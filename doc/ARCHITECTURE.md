@@ -56,10 +56,10 @@ a persistent backing store via tmux **control mode** (`tmux -CC`).
 
 | File | Role |
 |---|---|
-| `src/extension.ts` | Activation, lifecycle, terminal-profile + command registration, autoConnect, status bar, env-var forwarding. |
+| `src/extension.ts` | Activation, lifecycle, terminal-profile + command registration, autoConnect, status bar, env-var forwarding, start-directory resolution (incl. the multi-root folder pick). |
 | `src/tmuxTerminalProvider.ts` | The `vscode.Pseudoterminal` (`TmuxTerminal`). Forwards user input to a tmux pane, renders pane output back into xterm.js, and owns the tab name. |
 | `src/windowTitle.ts` | Pure helpers that decide the VS Code tab title from tmux's `#{window_name}` and `#{automatic-rename}`. |
-| `src/tmuxControlClient.ts` | High-level typed tmux operations (`newWindow`, `listWindows`, `resizeWindowForClient`, …), node-pty lifecycle, version gating. Wraps `TmuxGateway`. |
+| `src/tmuxControlClient.ts` | High-level typed tmux operations (`newWindow`, `listWindows`, `resizeWindowForClient`, …), node-pty resolution (see *Loading node-pty*) and PTY lifecycle, version gating. Wraps `TmuxGateway`. |
 | `src/tmuxGateway.ts` | Low-level control-mode protocol parser. Frames lines, handles `%begin/%end/%error`, manages the pending-command queue, defers writes until `%session-changed`, decodes `%output`/`%extended-output` payloads. |
 
 ## Activation flow
@@ -96,8 +96,8 @@ Behaviour:
 2. Resolve `tmux` binary, exec `tmux -V`, gate features by version.
 3. `new TmuxControlClient(...)` and `client.connect({ startDirectory })`.
    Internally this spawns `tmux -CC new-session -A -s <name>` in a node-pty
-   PTY, runs the protocol handshake, and resolves once the readiness probe
-   round-trips.
+   PTY (see *Loading node-pty* below), runs the protocol handshake, and
+   resolves once the readiness probe round-trips.
 4. Subscribe to `session-window-changed` and `tmux-exit` events.
 5. Set `default-terminal xterm-256color` and forward `VSCODE_*` env vars via
    `set-environment -t <session>`.
@@ -106,6 +106,47 @@ Behaviour:
      single initial window, OR
    * `windowsToAdopt[]` — when the session already existed; one entry per
      pre-existing tmux window.
+
+## Loading node-pty
+
+`tmux -CC` must run inside a real PTY. Rather than shipping a native
+dependency compiled per platform *and* per Electron ABI, the extension
+borrows the `node-pty` build that VS Code itself ships — by construction it
+matches the extension host's ABI. The catch is that *where* that build lives
+has changed several times across VS Code releases, and VS Code 1.129
+(re-)introduced ASAR packaging so the package is no longer loadable from a
+single directory at all. `requireNodePty()` in `tmuxControlClient.ts`
+resolves this in two stages:
+
+1. **Direct require (zero-copy).** Probe `<appRoot>/<root>/<pkg>` for every
+   combination of root × package name:
+   * roots: `node_modules` (remote server, Cursor, desktop ≤ 1.128),
+     `node_modules.asar` (desktop ≥ 1.129 and the older ASAR era: the JS
+     lives inside the archive — the extension host is an Electron process,
+     so requiring from inside the archive works and Electron transparently
+     redirects the native `pty.node` load to `node_modules.asar.unpacked`),
+     and `node_modules.asar.unpacked` (builds that unpacked the whole
+     module).
+   * packages: `node-pty` and `@vscode/node-pty`.
+2. **Copy-shim fallback** (`materializeNodePtyShim()`), for layouts that
+   ship *no* loadable JavaScript (none exist today; this guards against the
+   direction hinted at by VS Code's Copilot extension, which uses the same
+   technique). The extension bundles node-pty's JavaScript as a pinned
+   dependency (only `package.json` + `lib/**` are packaged into the VSIX —
+   see `.vscodeignore`), pairs it with the native files found under the
+   installation (`build/Release`, `build/Debug`, or
+   `prebuilds/<platform>-<arch>`), and materializes the combined package in
+   the extension's **global storage** — not the extension install directory,
+   which may be read-only and is replaced on every update. If the copy fails
+   but a usable shim is already materialized (typically a second VS Code
+   window's extension host holding the previously copied `pty.node` open on
+   Windows, so the overwrite raises `EPERM`/`EBUSY`), the existing shim is
+   reused.
+
+If both stages fail, the thrown error lists every candidate with its
+individual failure reason ("not found" vs. an actual load error such as an
+ABI mismatch) so the output channel pinpoints the problem — this is how
+issue #33 (VS Code 1.129) was diagnosed.
 
 ## Where new terminal tabs come from
 
@@ -126,8 +167,19 @@ There are three doorways into "create a VS Code terminal tab":
    `windowsToAdopt` snapshot and creates one VS Code terminal per remaining
    window via `vscode.window.createTerminal(buildTerminalOptions(w))`.
 
-Whichever path runs, `buildTerminalOptions(existingWindow?)` constructs a
-fresh `TmuxTerminal` and returns it as a `vscode.ExtensionTerminalOptions`.
+In a **multi-root workspace**, paths that create a *genuinely new* tmux
+window (`provideTerminalProfile` falling through to `newWindow`, and the
+`newTerminal` command) first show a quick-pick over the workspace folders
+(`pickStartDirectory`) to decide the terminal's start directory — VS Code
+does not expose its own folder selection to custom PTY profile providers.
+When the connection itself is about to create a brand-new session, the pick
+happens *before* connecting so the session starts in the chosen folder.
+Adoption and bootstrap paths skip the pick: their windows already have a
+working directory.
+
+Whichever path runs, `buildTerminalOptions(existingWindow?, startDirectory?)`
+constructs a fresh `TmuxTerminal` and returns it as a
+`vscode.ExtensionTerminalOptions`.
 The pty is also pushed onto `pendingTerminalPtys` so that
 `registerTerminalRenameSync` can later associate the resulting
 `vscode.Terminal` with its `TmuxTerminal` instance (used to detect built-in
